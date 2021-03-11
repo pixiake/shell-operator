@@ -58,6 +58,7 @@ func (bc BindingContext) MapV1() map[string]interface{} {
 		return res
 	}
 
+	// Set "snapshots" field if needed.
 	if len(bc.Metadata.IncludeSnapshots) > 0 || bc.Metadata.IncludeAllSnapshots {
 		if len(bc.Snapshots) > 0 {
 			res["snapshots"] = bc.Snapshots
@@ -66,6 +67,7 @@ func (bc BindingContext) MapV1() map[string]interface{} {
 		}
 	}
 
+	// Handle validating and conversion before grouping.
 	if bc.Metadata.BindingType == KubernetesValidating {
 		res["type"] = "Validating"
 		res["review"] = bc.AdmissionReview
@@ -80,8 +82,8 @@ func (bc BindingContext) MapV1() map[string]interface{} {
 		return res
 	}
 
-	// KubernetesValidating uses 'group' only for snapshots.
-	if bc.Metadata.Group != "" && bc.Metadata.BindingType != KubernetesValidating {
+	// Group is always has "type: Group", even for Synchronization.
+	if bc.Metadata.Group != "" {
 		res["binding"] = bc.Metadata.Group
 		res["type"] = "Group"
 		return res

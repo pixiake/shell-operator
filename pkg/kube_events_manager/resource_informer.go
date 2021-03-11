@@ -29,8 +29,9 @@ type ResourceInformer interface {
 	WithName(string)
 	WithKubeEventCb(eventCb func(KubeEvent))
 	CreateSharedInformer() error
-	GetExistedObjects() []ObjectAndFilterResult
+	CachedObjects() []ObjectAndFilterResult
 	CachedObjectsBytes() int64
+	EnableKubeEventCb() // Call it to use KubeEventCb to emit events.
 	Start()
 	Stop()
 	PauseHandleEvents()
@@ -44,14 +45,17 @@ type resourceInformer struct {
 	// Filter by object name
 	Name string
 
-	CachedObjects  map[string]*ObjectAndFilterResult
+	cachedObjects  map[string]*ObjectAndFilterResult
 	cacheLock      sync.RWMutex
 	SharedInformer cache.SharedInformer
 
 	GroupVersionResource schema.GroupVersionResource
 	ListOptions          metav1.ListOptions
 
-	eventCb func(KubeEvent)
+	// A buffer to store events between GetExistedObjects and EnableKubeEventCb.
+	eventBuf       []KubeEvent
+	eventCb        func(KubeEvent)
+	eventCbEnabled bool
 
 	// TODO resourceInformer should be stoppable (think of deleted namespaces and disabled modules in addon-operator)
 	ctx    context.Context
@@ -69,7 +73,7 @@ var _ ResourceInformer = &resourceInformer{}
 var NewResourceInformer = func(monitor *MonitorConfig) ResourceInformer {
 	informer := &resourceInformer{
 		Monitor:       monitor,
-		CachedObjects: make(map[string]*ObjectAndFilterResult),
+		cachedObjects: make(map[string]*ObjectAndFilterResult),
 		cacheLock:     sync.RWMutex{},
 	}
 	return informer
@@ -158,21 +162,39 @@ func (ei *resourceInformer) CreateSharedInformer() (err error) {
 	return nil
 }
 
-// TODO we need locks between HandleEvent and GetExistedObjects
-func (ei *resourceInformer) GetExistedObjects() []ObjectAndFilterResult {
+// Snapshot returns all cached objects for this informer
+func (ei *resourceInformer) CachedObjects() []ObjectAndFilterResult {
 	ei.cacheLock.RLock()
-	defer ei.cacheLock.RUnlock()
 	res := make([]ObjectAndFilterResult, 0)
-	for _, obj := range ei.CachedObjects {
+	for _, obj := range ei.cachedObjects {
 		res = append(res, *obj)
 	}
+	ei.cacheLock.RUnlock()
+	// Reset event buf.
+	ei.cacheLock.Lock()
+	defer ei.cacheLock.Unlock()
+	ei.eventBuf = nil
 	return res
+}
+
+func (ei *resourceInformer) EnableKubeEventCb() {
+	if ei.eventCbEnabled {
+		return
+	}
+	ei.cacheLock.Lock()
+	defer ei.cacheLock.Unlock()
+	ei.eventCbEnabled = true
+	for _, kubeEvent := range ei.eventBuf {
+		// Handle saved kube events.
+		ei.EventCb(kubeEvent)
+	}
+	ei.eventBuf = nil
 }
 
 func (ei *resourceInformer) CachedObjectsBytes() int64 {
 	ei.cacheLock.RLock()
 	defer ei.cacheLock.RUnlock()
-	return ObjectAndFilterResults(ei.CachedObjects).Bytes()
+	return ObjectAndFilterResults(ei.cachedObjects).Bytes()
 }
 
 // LoadExistedObjects get a list of existed objects in namespace that match selectors and
@@ -232,11 +254,11 @@ func (ei *resourceInformer) LoadExistedObjects() error {
 	ei.cacheLock.Lock()
 	defer ei.cacheLock.Unlock()
 	for k, v := range filteredObjects {
-		ei.CachedObjects[k] = v
+		ei.cachedObjects[k] = v
 	}
 
-	ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_objects", float64(len(ei.CachedObjects)), ei.Monitor.Metadata.MetricLabels)
-	ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_bytes", float64(ObjectAndFilterResults(ei.CachedObjects).Bytes()), ei.Monitor.Metadata.MetricLabels)
+	ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_objects", float64(len(ei.cachedObjects)), ei.Monitor.Metadata.MetricLabels)
+	ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_bytes", float64(ObjectAndFilterResults(ei.cachedObjects).Bytes()), ei.Monitor.Metadata.MetricLabels)
 
 	return nil
 }
@@ -275,7 +297,7 @@ func (ei *resourceInformer) HandleWatchEvent(object interface{}, eventType Watch
 
 	resourceId := ResourceId(obj)
 
-	// Always calculate checksum and update cache, because we need actual state in CachedObjects
+	// Always calculate checksum and update cache, because we need an actual state in CachedObjects.
 
 	var objFilterRes *ObjectAndFilterResult
 	var err error
@@ -299,13 +321,15 @@ func (ei *resourceInformer) HandleWatchEvent(object interface{}, eventType Watch
 
 	// Do not fire Added or Modified if object is in cache and its checksum is equal to the newChecksum.
 	// Delete is always fired.
+	ei.cacheLock.Lock()
+	defer ei.cacheLock.Unlock()
+
 	switch eventType {
 	case WatchEventAdded:
 		fallthrough
 	case WatchEventModified:
 		// Update object in cache
-		ei.cacheLock.Lock()
-		cachedObject, objectInCache := ei.CachedObjects[resourceId]
+		cachedObject, objectInCache := ei.cachedObjects[resourceId]
 		skipEvent := false
 		if objectInCache && cachedObject.Metadata.Checksum == objFilterRes.Metadata.Checksum {
 			// update object in cache and do not send event
@@ -316,20 +340,17 @@ func (ei *resourceInformer) HandleWatchEvent(object interface{}, eventType Watch
 			)
 			skipEvent = true
 		}
-		ei.CachedObjects[resourceId] = objFilterRes
-		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_objects", float64(len(ei.CachedObjects)), ei.Monitor.Metadata.MetricLabels)
-		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_bytes", float64(ObjectAndFilterResults(ei.CachedObjects).Bytes()), ei.Monitor.Metadata.MetricLabels)
-		ei.cacheLock.Unlock()
+		ei.cachedObjects[resourceId] = objFilterRes
+		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_objects", float64(len(ei.cachedObjects)), ei.Monitor.Metadata.MetricLabels)
+		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_bytes", float64(ObjectAndFilterResults(ei.cachedObjects).Bytes()), ei.Monitor.Metadata.MetricLabels)
 		if skipEvent {
 			return
 		}
 
 	case WatchEventDeleted:
-		ei.cacheLock.Lock()
-		delete(ei.CachedObjects, resourceId)
-		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_objects", float64(len(ei.CachedObjects)), ei.Monitor.Metadata.MetricLabels)
-		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_bytes", float64(ObjectAndFilterResults(ei.CachedObjects).Bytes()), ei.Monitor.Metadata.MetricLabels)
-		ei.cacheLock.Unlock()
+		delete(ei.cachedObjects, resourceId)
+		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_objects", float64(len(ei.cachedObjects)), ei.Monitor.Metadata.MetricLabels)
+		ei.metricStorage.GaugeSet("{PREFIX}kube_snapshot_bytes", float64(ObjectAndFilterResults(ei.cachedObjects).Bytes()), ei.Monitor.Metadata.MetricLabels)
 	}
 
 	// Fire KubeEvent only if needed.
@@ -342,12 +363,23 @@ func (ei *resourceInformer) HandleWatchEvent(object interface{}, eventType Watch
 		// TODO: should be disabled by default and enabled by a debug feature switch
 		//log.Debugf("HandleKubeEvent: obj type is %T, value:\n%#v", obj, obj)
 
-		// Pass event info to callback
-		ei.EventCb(KubeEvent{
+		kubeEvent := KubeEvent{
+			Type:        TypeEvent,
 			MonitorId:   ei.Monitor.Metadata.MonitorId,
 			WatchEvents: []WatchEventType{eventType},
 			Objects:     []ObjectAndFilterResult{*objFilterRes},
-		})
+		}
+
+		if ei.eventCbEnabled {
+			// Pass event info to callback.
+			ei.EventCb(kubeEvent)
+		} else {
+			// Save event in buffer until the callback is enabled.
+			if ei.eventBuf == nil {
+				ei.eventBuf = make([]KubeEvent, 0)
+			}
+			ei.eventBuf = append(ei.eventBuf, kubeEvent)
+		}
 	}
 }
 

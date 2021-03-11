@@ -693,13 +693,13 @@ kubernetes:
 
 #### "Synchronization" binding context for group
 
-During startup, the hook will be executed with the "Synchronization" binding context with `snapshots` JSON object:
+During startup, the hook will be executed with the "Group" binding context with `snapshots` JSON object that contains all objects from bindings in the group. Note there is no `objects` field as for "normal" binding:
 
 ```yaml
 [
   {
     "binding": "pods",
-    "type": "Synchronization",
+    "type": "Group",
     "snapshots": {
       "monitor_pods": [
         {
@@ -734,9 +734,9 @@ During startup, the hook will be executed with the "Synchronization" binding con
 ]
 ```
 
-#### "Group" binding context
+#### "Event" binding context for group
 
-If pod `pod-dfbd12` is then added into the "default" namespace, then the hook will be executed with the "Group" binding context:
+Hook is executed on event from every binding in group. So, if pod `pod-dfbd12` is added into the "default" namespace, then the hook will be executed with the "Group" binding context with `snapshots` JSON object that contains all objects from bindings in the group:
 
 ```yaml
 [
